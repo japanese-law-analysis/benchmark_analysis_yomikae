@@ -1,7 +1,9 @@
 use analysis_yomikae::{LawInfo, YomikaeError, YomikaeInfo};
 use anyhow::Result;
 use clap::Parser;
-use search_article_with_word::{self, Chapter, LawParagraph};
+use jplaw_text::LawContents;
+use regex::Regex;
+use search_article_with_word::{self, Chapter};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use tokio::{
@@ -52,27 +54,58 @@ async fn main() -> Result<()> {
     serde_json::from_str(std::str::from_utf8(&error_buffer)?)?;
   error_data_lst.sort_by(ord_yomikae_error);
   error_data_lst.dedup_by(|a, b| is_eq_yomikae_error(a, b));
-  let size_of_analysis_error_all = error_data_lst.len();
+  let mut size_of_analysis_error_all = 0;
   let mut contents_of_table = 0;
   let mut unmatched_parenthese = 0;
   let mut unexpected_parallel_words = 0;
   let mut analysis_error_data_contents_of_table = Vec::new();
   let mut analysis_error_data_unmatched_parenthese = Vec::new();
   let mut analysis_error_data_unexpected_parallel_words = Vec::new();
+  let mut size_of_not_analysis_yomikae_sentence = 0;
+  let mut size_of_not_analysis_yomikae_sentence_in_kagi = 0;
+  let mut size_of_not_analysis_yomikae_sentence_table = 0;
+  let mut size_of_not_analysis_yomikae_sentence_not_contains = 0;
+  let mut analysis_not_found_sentence_data_other = Vec::new();
   let mut error_data_stream = tokio_stream::iter(error_data_lst);
   while let Some(yomikae_error) = error_data_stream.next().await {
     match yomikae_error {
       YomikaeError::ContentsOfTable(info) => {
+        size_of_analysis_error_all += 1;
         contents_of_table += 1;
         analysis_error_data_contents_of_table.push(info)
       }
       YomikaeError::UnmatchedParen(info) => {
+        size_of_analysis_error_all += 1;
         unmatched_parenthese += 1;
         analysis_error_data_unmatched_parenthese.push(info)
       }
       YomikaeError::UnexpectedParallelWords(info) => {
+        size_of_analysis_error_all += 1;
         unexpected_parallel_words += 1;
         analysis_error_data_unexpected_parallel_words.push(info)
+      }
+      YomikaeError::NotFoundYomikae(info) => {
+        size_of_not_analysis_yomikae_sentence += 1;
+        let law_contents = &info.contents.contents;
+        let text = match law_contents {
+          LawContents::Text(str) => str,
+          _ => unreachable!(),
+        };
+        let in_kagi_kakko_re = Regex::new(r"[^「」]*「[^」]+と読み替える[^「」]*」.*").unwrap();
+        if !text.contains("と読み替える") {
+          size_of_not_analysis_yomikae_sentence_not_contains += 1;
+        } else if in_kagi_kakko_re.is_match(text) {
+          size_of_not_analysis_yomikae_sentence_in_kagi += 1;
+        } else if text.contains("それぞれ同表の下欄に掲げる字句と読み替える")
+          || text.contains("同表下欄の字句と読み替える")
+          || text.contains("同表の下欄の字句と読み替える")
+          || text.contains("下欄に掲げる字句と読み替える")
+          || text.contains("同表の下欄に掲げる日又は月と読み替える")
+        {
+          size_of_not_analysis_yomikae_sentence_table += 1;
+        } else {
+          analysis_not_found_sentence_data_other.push(info)
+        }
       }
     }
   }
@@ -83,27 +116,28 @@ async fn main() -> Result<()> {
     unexpected_parallel_words,
   };
 
-  let mut all_f = File::open(args.chapter_list).await?;
-  let mut all_buffer = Vec::new();
-  all_f.read_to_end(&mut all_buffer).await?;
-  let all_lst: Vec<LawParagraph> = serde_json::from_str(std::str::from_utf8(&all_buffer)?)?;
-  let mut size_of_all = 0;
-  let mut all_stream = tokio_stream::iter(all_lst);
-  while let Some(law_paragraph) = all_stream.next().await {
-    let len = law_paragraph.chapter_data.len();
-    size_of_all += len;
-  }
+  let size_of_not_analysis_yomikae_sentence = SizeOfNotFoundYomikae {
+    all: size_of_not_analysis_yomikae_sentence,
+    in_kagi_paren: size_of_not_analysis_yomikae_sentence_in_kagi,
+    table_contents: size_of_not_analysis_yomikae_sentence_table,
+    not_contains_toyomikaeru: size_of_not_analysis_yomikae_sentence_not_contains,
+    other: size_of_not_analysis_yomikae_sentence
+      - size_of_not_analysis_yomikae_sentence_in_kagi
+      - size_of_not_analysis_yomikae_sentence_table
+      - size_of_not_analysis_yomikae_sentence_not_contains,
+  };
 
   let data_of_analysis_yomikae = DataOfAnalysisYomikae {
-    size_of_all,
+    size_of_all: size_of_analysis
+      + size_of_analysis_error.all
+      + size_of_not_analysis_yomikae_sentence.all,
     size_of_analysis,
     size_of_analysis_error,
-    size_of_not_analysis_yomikae_sentence: size_of_all
-      - size_of_analysis
-      - size_of_analysis_error.all,
+    size_of_not_analysis_yomikae_sentence,
     analysis_error_data_contents_of_table,
     analysis_error_data_unmatched_parenthese,
     analysis_error_data_unexpected_parallel_words,
+    analysis_not_found_sentence_data_other,
   };
 
   let mut file = File::create(args.output).await?;
@@ -121,6 +155,19 @@ pub struct SizeOfAnalysisError {
   unexpected_parallel_words: usize,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize, Serialize, Copy)]
+pub struct SizeOfNotFoundYomikae {
+  pub all: usize,
+  /// 鍵括弧内にある場合
+  pub in_kagi_paren: usize,
+  /// 別表参照の場合
+  pub table_contents: usize,
+  /// そもそもとして「と読み替える」を含んでいない
+  pub not_contains_toyomikaeru: usize,
+  /// その他
+  pub other: usize,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LawSentenceInfo {
   num: String,
@@ -132,10 +179,11 @@ pub struct DataOfAnalysisYomikae {
   pub size_of_all: usize,
   pub size_of_analysis: usize,
   pub size_of_analysis_error: SizeOfAnalysisError,
-  pub size_of_not_analysis_yomikae_sentence: usize,
+  pub size_of_not_analysis_yomikae_sentence: SizeOfNotFoundYomikae,
   pub analysis_error_data_contents_of_table: Vec<LawInfo>,
   pub analysis_error_data_unmatched_parenthese: Vec<LawInfo>,
   pub analysis_error_data_unexpected_parallel_words: Vec<LawInfo>,
+  pub analysis_not_found_sentence_data_other: Vec<LawInfo>,
 }
 
 fn ord_yomikae_error(a: &YomikaeError, b: &YomikaeError) -> Ordering {
@@ -159,6 +207,7 @@ fn get_law_info_from_yomikae_error(err: &YomikaeError) -> LawInfo {
     YomikaeError::ContentsOfTable(info) => info.clone(),
     YomikaeError::UnmatchedParen(info) => info.clone(),
     YomikaeError::UnexpectedParallelWords(info) => info.clone(),
+    YomikaeError::NotFoundYomikae(info) => info.clone(),
   }
 }
 
